@@ -57,8 +57,60 @@ def load_terms(args) -> list[str]:
     return expanded
 
 
-def redact(src: Path, dst: Path, terms: list[str], fill: bool) -> None:
+def page_chars(page) -> list[tuple[str, pymupdf.Rect, int]]:
+    """ページ上の全文字を (文字, 位置, 行番号) のリストで返す"""
+    chars = []
+    line_no = 0
+    for block in page.get_text("rawdict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line["spans"]:
+                for ch in span["chars"]:
+                    chars.append((ch["c"], pymupdf.Rect(ch["bbox"]), line_no))
+            line_no += 1
+    return chars
+
+
+def find_char_matches(page, terms: list[str]) -> tuple[list[pymupdf.Rect], list[pymupdf.Rect]]:
+    """
+    指定文字列に一致する文字を1文字単位で探す。
+    PyMuPDF の search_for は行末のハイフンを読み飛ばすため位置が1文字ずれることがあり、
+    使わずに各文字の位置情報から直接マッチさせる。空白・改行・全角半角の違いは無視する。
+    戻り値: (黒塗りする矩形のリスト[行ごとにまとめたもの], 一致した各文字の矩形のリスト)
+    """
+    chars = page_chars(page)
+    seq_chars, seq_index = [], []
+    for i, (c, _, _) in enumerate(chars):
+        for n in normalize(c):
+            seq_chars.append(n)
+            seq_index.append(i)
+    text = "".join(seq_chars)
+
+    hit = set()
+    for term in terms:
+        t = normalize(term)
+        if not t:
+            continue
+        start = text.find(t)
+        while start != -1:
+            hit.update(seq_index[start:start + len(t)])
+            start = text.find(t, start + 1)
+
+    # 同じ行で連続する文字は1つの矩形にまとめる
+    rects = []
+    prev = None
+    for i in sorted(hit):
+        _, bbox, line = chars[i]
+        if prev is not None and i == prev[0] + 1 and line == prev[1]:
+            rects[-1] |= bbox
+        else:
+            rects.append(pymupdf.Rect(bbox))
+        prev = (i, line)
+    return rects, [chars[i][1] for i in sorted(hit)]
+
+
+def redact(src: Path, dst: Path, terms: list[str], fill: bool) -> dict[int, list[pymupdf.Rect]]:
     doc = pymupdf.open(src)
+    matched = {}  # ページ番号 → 一致した各文字の位置（確認用）
     if doc.needs_pass:
         doc.close()
         raise ValueError("パスワード付きの PDF です。パスワードを外してから実行してください。")
@@ -70,11 +122,12 @@ def redact(src: Path, dst: Path, terms: list[str], fill: bool) -> None:
         if not page.get_text().strip():
             pages_without_text.append(page.number + 1)
 
-        hits = 0
-        for term in terms:
-            for rect in page.search_for(term):
-                page.add_redact_annot(rect, fill=(0, 0, 0) if fill else None)
-                hits += 1
+        rects, char_boxes = find_char_matches(page, terms)
+        for rect in rects:
+            page.add_redact_annot(rect, fill=(0, 0, 0) if fill else None)
+        hits = len(rects)
+        if char_boxes:
+            matched[page.number] = char_boxes
 
         # 注釈（コメント・付箋など）の中身に含まれる場合はその注釈ごと削除
         for annot in list(page.annots() or []):
@@ -121,17 +174,29 @@ def redact(src: Path, dst: Path, terms: list[str], fill: bool) -> None:
             "※ 次のページは文字データがありません（スキャン画像の可能性）。"
             f"画像内の文字はこのスクリプトでは消せません: {pages_without_text}"
         )
+    return matched
 
 
-def verify(dst: Path, terms: list[str]) -> bool:
+def verify(dst: Path, terms: list[str], matched: dict[int, list[pymupdf.Rect]]) -> bool:
     """出力ファイルを読み直して、文字列が残っていないか確認"""
     doc = pymupdf.open(dst)
     found = []
     for page in doc:
-        text = normalize(page.get_text())
+        chars = page_chars(page)
+        text = normalize("".join(c for c, _, _ in chars))
         for t in terms:
             if normalize(t) in text:
                 found.append(f"ページ {page.number + 1} の本文: {t}")
+        # 消したはずの文字の位置に、1文字でも残っていないか
+        leftover = [
+            c for c, bbox, _ in chars
+            if c.strip() and any(box.contains((bbox.tl + bbox.br) / 2) for box in matched.get(page.number, []))
+        ]
+        if leftover:
+            found.append(
+                f"ページ {page.number + 1} の黒塗り位置に文字があります: {''.join(leftover)}"
+                "（消し残し、または文字のずれ。PDF を開いて目で確認してください）"
+            )
         for annot in page.annots() or []:
             content = normalize(" ".join(str(v) for v in annot.info.values()))
             for t in terms:
@@ -188,8 +253,8 @@ def main():
         dst = out_dir / (PREFIX + src.name)
         print(f"\n===== {src.name} =====")
         try:
-            redact(src, dst, terms, fill=not args.no_fill)
-            if not verify(dst, terms):
+            matched = redact(src, dst, terms, fill=not args.no_fill)
+            if not verify(dst, terms, matched):
                 failed.append(src.name)
         except Exception as e:  # 1つ失敗しても残りは続ける
             print(f"[エラー] {e}")
