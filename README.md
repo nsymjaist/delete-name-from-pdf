@@ -1,4 +1,4 @@
-# delete-name-from-pdf
+# delete name from pdf
 PDFファイルから指定した文字列を消すツール
 
 
@@ -20,12 +20,12 @@ pip install pymupdf
 ```
 消したい文字列を datalist.txt に1行に1つずつ書きます。
 ```
-\# 氏名
+# 氏名
 山田太郎
 山田 太郎
 Yamada Taro
 
-\# 連絡先
+# 連絡先
 taro@example.com
 090-1234-5678
 ```
